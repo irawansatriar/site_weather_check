@@ -1,6 +1,5 @@
-# streamlit_app_custom_with_editor.py
+# streamlit_app_custom_with_editor_openweather.py
 
-import io
 import os
 from datetime import date, datetime, timedelta
 from typing import Tuple, Optional, List
@@ -18,10 +17,12 @@ APP_TITLE = "Site Weather Check (OpenWeatherMap)"
 SITES_CSV = "sites.csv"
 
 # OpenWeatherMap API configuration
-OPENWEATHERMAP_API_KEY = st.secrets.get("OPENWEATHERMAP_API_KEY", "your_api_key_here")
-CURRENT_WEATHER_URL = "https://api.openweathermap.org/data/2.5/weather"
+OPENWEATHERMAP_API_KEY = (
+    st.secrets.get("OPENWEATHERMAP_API_KEY")
+    or os.environ.get("OPENWEATHERMAP_API_KEY")
+    or ""
+)
 FORECAST_URL = "https://api.openweathermap.org/data/2.5/forecast"
-ONECALL_URL = "https://api.openweathermap.org/data/3.0/onecall"
 
 # Forecast horizon in days for OpenWeatherMap
 FORECAST_MAX_DAYS = 5
@@ -59,7 +60,6 @@ def load_sites_csv(path: str = SITES_CSV) -> pd.DataFrame:
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"sites.csv missing required columns: {', '.join(sorted(missing))}")
-    
     df["location"] = df["location"].astype(str).str.strip()
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
@@ -109,7 +109,7 @@ def normalize_sites_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     if not required.issubset(df.columns):
         found = ", ".join(df.columns)
         raise ValueError(
-            f"Could not find required columns after normalization. "
+            "Could not find required columns after normalization. "
             f"Found columns: {found}. Expected: location, latitude, longitude."
         )
 
@@ -150,24 +150,22 @@ def owm_weather_to_text(weather_main: str, weather_description: str) -> str:
     """Convert OpenWeatherMap weather info to simplified text."""
     if not weather_main:
         return "unknown"
-    
     main_lower = weather_main.lower()
     if main_lower == "clear":
         return "sunny"
-    elif main_lower == "clouds":
+    if main_lower == "clouds":
         return "cloudy"
-    elif main_lower == "rain":
+    if main_lower == "rain":
         return "rainy"
-    elif main_lower == "drizzle":
+    if main_lower == "drizzle":
         return "light rain"
-    elif main_lower == "thunderstorm":
+    if main_lower == "thunderstorm":
         return "thunderstorm"
-    elif main_lower == "snow":
+    if main_lower == "snow":
         return "snowy"
-    elif main_lower == "mist" or main_lower == "fog":
+    if main_lower in {"mist", "fog", "haze"}:
         return "foggy"
-    else:
-        return weather_description.lower() if weather_description else main_lower
+    return weather_description.lower() if weather_description else main_lower
 
 
 # --------------------------
@@ -181,17 +179,32 @@ def _request_openweathermap(url: str, params: dict) -> dict:
         r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=30)
         r.raise_for_status()
         data = r.json()
-        
-        if "message" in data and data.get("cod") != 200:
-            raise ValueError(f"OpenWeatherMap error: {data['message']}")
+        cod = data.get("cod", 200)
+        cod_str = str(cod)
+        if cod_str != "200":
+            # OWM returns error info in 'message'
+            msg = data.get("message", f"HTTP cod {cod_str}")
+            raise ValueError(f"OpenWeatherMap error: {msg}")
         return data
     except requests.exceptions.HTTPError as e:
-        detail = ""
+        # Scrub API key from any logged URL
+        safe_url = ""
         try:
-            detail = f" | response: {r.text[:500]}"
+            req_url = r.request.url or ""
+            if OPENWEATHERMAP_API_KEY:
+                safe_url = req_url.replace(OPENWEATHERMAP_API_KEY, "****")
+            else:
+                safe_url = req_url
         except Exception:
             pass
-        raise RuntimeError(f"OpenWeatherMap HTTP error: {e}{detail}") from e
+        body = ""
+        try:
+            body = r.text[:500]
+        except Exception:
+            pass
+        status = getattr(e.response, "status_code", "HTTP")
+        reason = getattr(e.response, "reason", "Error")
+        raise RuntimeError(f"OpenWeatherMap HTTP error: {status} {reason} for url: {safe_url} | response: {body}") from e
     except Exception as e:
         raise RuntimeError(f"OpenWeatherMap fetch failed: {e}") from e
 
@@ -201,18 +214,11 @@ def fetch_openweathermap_forecast(lat: float, lon: float, start_d: date, end_d: 
     today = date.today()
     if start_d > today + timedelta(days=FORECAST_MAX_DAYS):
         return pd.DataFrame()
-    
-    params = {
-        "lat": lat,
-        "lon": lon,
-    }
-    
+    params = {"lat": lat, "lon": lon}
     data = _request_openweathermap(FORECAST_URL, params)
-    
     forecast_list = data.get("list", [])
     if not forecast_list:
         return pd.DataFrame()
-    
     rows = []
     for item in forecast_list:
         dt = datetime.fromtimestamp(item["dt"])
@@ -220,20 +226,23 @@ def fetch_openweathermap_forecast(lat: float, lon: float, start_d: date, end_d: 
             weather = item.get("weather", [{}])[0]
             main_weather = weather.get("main", "")
             description = weather.get("description", "")
-            
-            rows.append({
-                "time": dt,
-                "date": dt.date(),
-                "hour_label": dt.strftime("%H:00"),
-                "weather_main": main_weather,
-                "weather_description": description,
-                "weather_text": owm_weather_to_text(main_weather, description),
-                "precipitation": item.get("rain", {}).get("3h", 0) + item.get("snow", {}).get("3h", 0),
-                "cloudcover": item.get("clouds", {}).get("all", 0),
-                "temperature": item.get("main", {}).get("temp", np.nan),
-                "humidity": item.get("main", {}).get("humidity", np.nan),
-            })
-    
+            rain_3h = item.get("rain", {}).get("3h", 0) or 0
+            snow_3h = item.get("snow", {}).get("3h", 0) or 0
+            precip = float(rain_3h) + float(snow_3h)
+            rows.append(
+                {
+                    "time": dt,
+                    "date": dt.date(),
+                    "hour_label": dt.strftime("%H:00"),
+                    "weather_main": main_weather,
+                    "weather_description": description,
+                    "weather_text": owm_weather_to_text(main_weather, description),
+                    "precipitation": precip,
+                    "cloudcover": item.get("clouds", {}).get("all", 0),
+                    "temperature": item.get("main", {}).get("temp", np.nan),
+                    "humidity": item.get("main", {}).get("humidity", np.nan),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -249,15 +258,12 @@ def fetch_openweathermap_range(lat: float, lon: float, start_d: date, end_d: dat
 def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> Tuple[pd.DataFrame, pd.DataFrame]:
     lat = float(site_row["latitude"])
     lon = float(site_row["longitude"])
-
     df = fetch_openweathermap_range(lat, lon, start_d, end_d)
-
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
-
     raw_cols = [
         "time",
-        "date", 
+        "date",
         "hour_label",
         "weather_main",
         "weather_description",
@@ -268,15 +274,16 @@ def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> 
         "humidity",
     ]
     hourly_df = df[raw_cols].copy()
-
-    pivot = hourly_df.pivot_table(
-        index="hour_label",
-        columns="date",
-        values="weather_text",
-        aggfunc="first",
-        dropna=False,
-    ).sort_index()
-
+    pivot = (
+        hourly_df.pivot_table(
+            index="hour_label",
+            columns="date",
+            values="weather_text",
+            aggfunc="first",
+            dropna=False,
+        )
+        .sort_index()
+    )
     return pivot, hourly_df
 
 
@@ -287,7 +294,6 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
     missing = required - set(req.columns)
     if missing:
         raise ValueError(f"Requests CSV missing required columns: {', '.join(sorted(missing))}")
-
     req["start_date"] = pd.to_datetime(req["start_date"], errors="coerce").dt.date
     req["end_date"] = pd.to_datetime(req["end_date"], errors="coerce").dt.date
 
@@ -300,7 +306,6 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
 
     results = []
     failures = []
-
     for _, row in merged.iterrows():
         loc = str(row["location"]).strip()
         lat = row.get("latitude", np.nan)
@@ -309,25 +314,18 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
         ed = row.get("end_date", None)
 
         if pd.isna(lat) or pd.isna(lon):
-            failures.append(
-                {"location": loc, "start_date": sd, "end_date": ed, "error": "Location not found in sites.csv"}
-            )
+            failures.append({"location": loc, "start_date": sd, "end_date": ed, "error": "Location not found in sites.csv"})
             continue
         if pd.isna(sd) or pd.isna(ed):
-            failures.append(
-                {"location": loc, "start_date": sd, "end_date": ed, "error": "Invalid start/end date"}
-            )
+            failures.append({"location": loc, "start_date": sd, "end_date": ed, "error": "Invalid start/end date"})
             continue
 
         try:
             sd_v, ed_v = validate_date_range(to_date(sd), to_date(ed))
             df = fetch_openweathermap_range(float(lat), float(lon), sd_v, ed_v)
             if df.empty:
-                failures.append(
-                    {"location": loc, "start_date": sd_v, "end_date": ed_v, "error": "No data returned for range"}
-                )
+                failures.append({"location": loc, "start_date": sd_v, "end_date": ed_v, "error": "No data returned for range"})
                 continue
-
             df_out = df.copy()
             df_out.insert(0, "location", loc)
             df_out = df_out[
@@ -337,7 +335,7 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
                     "date",
                     "hour_label",
                     "weather_main",
-                    "weather_description", 
+                    "weather_description",
                     "weather_text",
                     "precipitation",
                     "cloudcover",
@@ -346,7 +344,6 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
                 ]
             ]
             results.append(df_out)
-
         except Exception as e:
             failures.append({"location": loc, "start_date": sd, "end_date": ed, "error": str(e)})
 
@@ -438,7 +435,6 @@ def render_sites_editor():
 
 def render_single_site_ui(sites_df: pd.DataFrame):
     st.header("B. Single site selection")
-
     site_names = sites_df["location"].tolist()
     site_sel = st.selectbox("Select a site (from sites.csv)", site_names)
 
@@ -448,44 +444,26 @@ def render_single_site_ui(sites_df: pd.DataFrame):
     end_d = st.date_input("End date", value=default_end, format="YYYY-MM-DD")
 
     submit = st.button("Build pivot", type="primary")
-
     if submit:
-        if OPENWEATHERMAP_API_KEY == "your_api_key_here":
-            st.error("Please set your OpenWeatherMap API key in Streamlit secrets or update the code.")
-            st.info("Get a free API key at: https://openweathermap.org/api")
-            return
-            
         site_row = sites_df.loc[sites_df["location"] == site_sel].iloc[0]
         try:
             sd, ed = validate_date_range(to_date(start_d), to_date(end_d))
             with st.spinner("Fetching data..."):
                 pivot_df, hourly_df = build_single_site_pivot(site_row, sd, ed)
-
             if hourly_df.empty:
                 st.warning("No data returned for the requested range.")
                 return
-
             st.subheader("Pivot (rows: hour 00:00–23:00, columns: date, values: weather)")
             st.dataframe(pivot_df, use_container_width=True)
             st.caption("Note: values show simplified weather descriptions per hour.")
-
             c1, c2 = st.columns(2)
             with c1:
                 pivot_flat = pivot_df.copy()
                 pivot_flat.index.name = "hour"
                 pivot_flat.reset_index(inplace=True)
-                download_csv_button(
-                    pivot_flat,
-                    "Download pivot CSV",
-                    f"{site_sel}_pivot_{sd}_to_{ed}.csv",
-                )
+                download_csv_button(pivot_flat, "Download pivot CSV", f"{site_sel}_pivot_{sd}_to_{ed}.csv")
             with c2:
-                download_csv_button(
-                    hourly_df,
-                    "Download raw hourly CSV",
-                    f"{site_sel}_hourly_{sd}_to_{ed}.csv",
-                )
-
+                download_csv_button(hourly_df, "Download raw hourly CSV", f"{site_sel}_hourly_{sd}_to_{ed}.csv")
         except Exception as e:
             st.error(f"Failed to build pivot: {e}")
 
@@ -515,29 +493,20 @@ def render_batch_ui(sites_df: pd.DataFrame):
             return
 
         if st.button("Run batch", type="primary"):
-            if OPENWEATHERMAP_API_KEY == "your_api_key_here":
-                st.error("Please set your OpenWeatherMap API key in Streamlit secrets or update the code.")
-                st.info("Get a free API key at: https://openweathermap.org/api")
-                return
-                
             try:
                 with st.spinner("Processing batch..."):
                     res_df, fail_df = process_batch_requests(req_df, sites_df)
-
                 if not res_df.empty:
                     st.subheader("Combined results (hourly)")
                     st.dataframe(res_df.head(200), use_container_width=True)
                     st.caption("Showing first 200 rows. Use download for full data.")
                     download_csv_button(res_df, "Download all results CSV", "batch_hourly_results.csv")
-
                 if not fail_df.empty:
                     st.subheader("Failed rows")
                     st.dataframe(fail_df, use_container_width=True)
                     download_csv_button(fail_df, "Download failures CSV", "batch_failures.csv")
-
                 if res_df.empty and fail_df.empty:
                     st.info("No output produced.")
-
             except Exception as e:
                 st.error(f"Batch processing failed: {e}")
 
@@ -545,11 +514,13 @@ def render_batch_ui(sites_df: pd.DataFrame):
 def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    
-    if OPENWEATHERMAP_API_KEY == "your_api_key_here":
-        st.warning("⚠️ OpenWeatherMap API key not configured. Please set it in Streamlit secrets.")
+
+    # Require API key early and stop if missing
+    if not OPENWEATHERMAP_API_KEY:
+        st.error("OpenWeatherMap API key not configured. Set OPENWEATHERMAP_API_KEY in Streamlit secrets or environment.")
         st.info("Get a free API key at: https://openweathermap.org/api")
-    
+        st.stop()
+
     st.write(
         "- Time format: 24-hour (HH:00)\n"
         "- Mode A: upload requests CSV with location,start_date,end_date (dates in YYYY-MM-DD)\n"
@@ -569,7 +540,6 @@ def main():
         st.stop()
 
     mode = st.radio("Choose mode", ["B. Single site selection", "A. Upload batch CSV"], index=0, horizontal=True)
-
     if mode.startswith("B"):
         render_single_site_ui(sites_df)
     else:
@@ -579,11 +549,10 @@ def main():
     with st.expander("Help / Tips"):
         st.markdown(
             """
-            - **API Key Setup**: Get a free OpenWeatherMap API key at https://openweathermap.org/api
-            - **Streamlit Secrets**: Add your API key to `.streamlit/secrets.toml` as `OPENWEATHERMAP_API_KEY = "your_key"`
-            - **Rate Limits**: OpenWeatherMap free tier allows 1,000 calls/day
-            - **Date Range**: Limited to 5 days forecast (OpenWeatherMap free tier)
-            - **File Uploads**: Accept aliases for column names (name/site → location, lat → latitude, etc.)
+            - API Key: Set OPENWEATHERMAP_API_KEY in Streamlit secrets or environment.
+            - Rate Limits: OpenWeatherMap free tier allows ~1,000 calls/day.
+            - Date Range: Limited to ~5 days ahead via 5-day/3-hour forecast API.
+            - File Uploads: Accept aliases for column names (name/site → location, lat → latitude, lon/lng/long → longitude).
             """
         )
 
