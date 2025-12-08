@@ -1,4 +1,4 @@
-You're getting a syntax error because I accidentally included the changelog comments inside the Python code. Here's the corrected version without those comments:
+I made the same mistake again! Here's the corrected version with all the changelog comments removed:
 
 ```python
 # streamlit_app_custom_with_editor.py
@@ -142,7 +142,7 @@ def to_date(obj) -> date:
 def validate_date_range(start: date, end: date) -> Tuple[date, date]:
     if end < start:
         raise ValueError("End date must be on or after start date.")
-    earliest = date.today() - timedelta(days=5)  # OpenWeatherMap has limited historical data
+    earliest = date.today() - timedelta(days=5)
     latest = date.today() + timedelta(days=FORECAST_MAX_DAYS)
     s = max(start, earliest)
     e = min(end, latest)
@@ -549,7 +549,6 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
     
-    # API key check
     if OPENWEATHERMAP_API_KEY == "your_api_key_here":
         st.warning("⚠️ OpenWeatherMap API key not configured. Please set it in Streamlit secrets.")
         st.info("Get a free API key at: https://openweathermap.org/api")
@@ -596,23 +595,15 @@ if __name__ == "__main__":
     main()
 ```
 
-**Key changes made:**
+This version should work without any syntax errors. The main changes from the Open-Meteo version:
 
-1. **Fixed the syntax error** by removing the changelog comments that were accidentally included in the code
-2. **Added API key management** using Streamlit secrets
-3. **Updated to use OpenWeatherMap's 5-day forecast endpoint** (free tier)
-4. **Added proper error handling** for missing API keys
-5. **Updated weather code mapping** to work with OpenWeatherMap's weather data structure
-6. **Added temperature and humidity data** from OpenWeatherMap
-7. **Simplified the API calls** to work with OpenWeatherMap's free tier
+1. Uses OpenWeatherMap's 5-day forecast API
+2. Requires an API key (free registration at openweathermap.org)
+3. Returns weather descriptions, temperature, humidity, precipitation, and cloud cover
+4. Handles API key validation and shows helpful error messages
+5. Uses Streamlit secrets for secure API key storage
 
-**To use this:**
-
-1. Get a free API key from https://openweathermap.org/api
-2. Add it to your Streamlit secrets file (`.streamlit/secrets.toml`):
-   ```toml
-   OPENWEATHERMAP_API_KEY = "your_actual_api_key_here"
-   ```
-3. Replace your current file with this corrected version
-
-The app will now work with OpenWeatherMap and show a warning if the API key isn't configured.
+To set up your API key, create a `.streamlit/secrets.toml` file with:
+```toml
+OPENWEATHERMAP_API_KEY = "your_actual_api_key_here"
+```
