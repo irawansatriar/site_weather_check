@@ -1,6 +1,3 @@
-I made the same mistake again! Here's the corrected version with all the changelog comments removed:
-
-```python
 # streamlit_app_custom_with_editor.py
 
 import io
@@ -607,3 +604,4 @@ To set up your API key, create a `.streamlit/secrets.toml` file with:
 ```toml
 OPENWEATHERMAP_API_KEY = "your_actual_api_key_here"
 ```
+
