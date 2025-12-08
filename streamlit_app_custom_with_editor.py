@@ -23,7 +23,6 @@ FORECAST_API = "https://api.open-meteo.com/v1/forecast"
 ARCHIVE_API = "https://archive-api.open-meteo.com/v1/archive"
 
 # Variables requested from Open-Meteo (use ones supported by both endpoints)
-# Note: precipitation_probability is not available in all archive models; keep common set.
 HOURLY_VARS = [
     "weathercode",
     "precipitation",
@@ -62,10 +61,14 @@ def ensure_sites_csv_exists(path: str = SITES_CSV) -> None:
 def load_sites_csv(path: str = SITES_CSV) -> pd.DataFrame:
     ensure_sites_csv_exists(path)
     df = pd.read_csv(path, dtype={"location": str}, encoding="utf-8").dropna(how="all")
-    required = {"location", "latitude", "longitude", "timezone"}
+    # timezone is optional now; default to 'auto' if missing
+    required = {"location", "latitude", "longitude"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"sites.csv missing required columns: {', '.join(sorted(missing))}")
+    if "timezone" not in df.columns:
+        df["timezone"] = "auto"
+
     # Normalize column types
     df["location"] = df["location"].astype(str).str.strip()
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
@@ -76,11 +79,13 @@ def load_sites_csv(path: str = SITES_CSV) -> pd.DataFrame:
 
 
 def save_sites_csv(df: pd.DataFrame, path: str = SITES_CSV) -> None:
-    cols = ["location", "latitude", "longitude", "timezone"]
-    missing = [c for c in cols if c not in df.columns]
+    cols_required = ["location", "latitude", "longitude"]
+    missing = [c for c in cols_required if c not in df.columns]
     if missing:
         raise ValueError(f"Cannot save sites.csv, missing columns: {missing}")
     df = df.copy()
+    if "timezone" not in df.columns:
+        df["timezone"] = "auto"
     df["location"] = df["location"].astype(str).str.strip()
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
@@ -119,8 +124,6 @@ def validate_date_range(start: date, end: date) -> Tuple[date, date]:
 
 
 def weathercode_to_text(code: int) -> str:
-    # Mapping per Open-Meteo weather codes
-    # Simplified to short descriptive categories
     mapping = {
         0: "sunny",
         1: "mainly clear",
@@ -155,21 +158,83 @@ def weathercode_to_text(code: int) -> str:
 
 
 # --------------------------
+# CSV Normalization Helpers
+# --------------------------
+
+def normalize_sites_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Accept flexible input headers and normalize to: location, latitude, longitude, timezone.
+    - Handles common aliases (name/site/place -> location; lat -> latitude; lon/lng/long -> longitude; tz/time_zone -> timezone)
+    - Strips whitespace and BOM
+    - Auto-fills timezone='auto' if missing
+    """
+    notes: List[str] = []
+    # Remove BOM in headers if present and strip whitespace
+    orig_cols = list(df.columns)
+    clean_cols = [str(c).replace("\ufeff", "").strip() for c in orig_cols]
+    lower_cols = [c.lower() for c in clean_cols]
+
+    alias_map = {
+        "location": {"location", "site", "name", "place"},
+        "latitude": {"latitude", "lat"},
+        "longitude": {"longitude", "lon", "lng", "long"},
+        "timezone": {"timezone", "tz", "time_zone", "time zone"},
+    }
+
+    rename_dict = {}
+    used_targets = set()
+    for i, lc in enumerate(lower_cols):
+        target = None
+        for key, aliases in alias_map.items():
+            if lc in aliases and key not in used_targets:
+                target = key
+                used_targets.add(key)
+                break
+        rename_dict[orig_cols[i]] = target if target else lc
+
+    df = df.rename(columns=rename_dict)
+
+    required = {"location", "latitude", "longitude"}
+    if not required.issubset(df.columns):
+        found = ", ".join(df.columns)
+        raise ValueError(
+            "Could not find required columns after normalization. "
+            f"Found columns: {found}. Expected at least: location, latitude, longitude. "
+            "Accepted aliases: location(name/site/place), latitude(lat), longitude(lon/lng/long), timezone(tz/time_zone)."
+        )
+
+    if "timezone" not in df.columns:
+        df["timezone"] = "auto"
+        notes.append("timezone defaulted to 'auto' for all rows.")
+
+    # Coerce types and clean
+    df["location"] = df["location"].astype(str).str.strip()
+    df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
+    df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
+    df["timezone"] = df["timezone"].astype(str).str.strip()
+
+    before = len(df)
+    df = df.dropna(subset=["location", "latitude", "longitude"])
+    dropped = before - len(df)
+    if dropped:
+        notes.append(f"dropped {dropped} rows with missing/invalid location/lat/lon.")
+
+    return df, notes
+
+
+# --------------------------
 # Open-Meteo Fetching
 # --------------------------
 
 def _request_open_meteo(url: str, params: dict) -> dict:
     try:
         r = requests.get(url, params=params, headers={"User-Agent": USER_AGENT}, timeout=30)
-        # If the API returns non-200, try to provide readable info
         r.raise_for_status()
         data = r.json()
-        # Basic validation
         if "hourly" not in data or "time" not in data["hourly"]:
             raise ValueError("No hourly data returned by API.")
         return data
     except requests.exceptions.HTTPError as e:
-        # Add response text if available (Open-Meteo usually safe)
         detail = ""
         try:
             detail = f" | response: {r.text[:500]}"
@@ -182,11 +247,9 @@ def _request_open_meteo(url: str, params: dict) -> dict:
 
 @st.cache_data(show_spinner=False)
 def fetch_open_meteo_forecast(lat: float, lon: float, start_d: date, end_d: date, tz: str) -> pd.DataFrame:
-    # Clamp forecast to supported horizon
     today_utc = date.today()
     max_end = today_utc + timedelta(days=FORECAST_MAX_DAYS)
     if start_d > max_end:
-        # Out of forecast range
         return pd.DataFrame()
     end_clamped = min(end_d, max_end)
 
@@ -204,7 +267,6 @@ def fetch_open_meteo_forecast(lat: float, lon: float, start_d: date, end_d: date
 
 @st.cache_data(show_spinner=False)
 def fetch_open_meteo_archive(lat: float, lon: float, start_d: date, end_d: date, tz: str) -> pd.DataFrame:
-    # Archive supports large spans, but keep reasonable constraints already applied by validate_date_range
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -223,23 +285,18 @@ def hourly_json_to_df(data: dict) -> pd.DataFrame:
     df = pd.DataFrame({"time": pd.to_datetime(times, utc=False, errors="coerce")})
     for var in HOURLY_VARS:
         df[var] = hourly.get(var, [np.nan] * len(df))
-    # Derived fields
     df["date"] = df["time"].dt.date
-    # 24-hour format label
     df["hour_label"] = df["time"].dt.strftime("%H:00")
     df["weather_text"] = df["weathercode"].apply(lambda x: weathercode_to_text(int(x)) if pd.notna(x) else "")
     return df
 
 
 def fetch_open_meteo_range(lat: float, lon: float, start_d: date, end_d: date, tz: str) -> pd.DataFrame:
-    """Fetch past+future seamlessly by combining Archive and Forecast where needed."""
     start_d, end_d = validate_date_range(start_d, end_d)
-
     today_d = date.today()
 
     parts: List[pd.DataFrame] = []
 
-    # Past (strictly before today) -> archive
     if start_d < today_d:
         arch_end = min(end_d, today_d - timedelta(days=1))
         if start_d <= arch_end:
@@ -247,7 +304,6 @@ def fetch_open_meteo_range(lat: float, lon: float, start_d: date, end_d: date, t
             if not df_arch.empty:
                 parts.append(df_arch)
 
-    # Today..future -> forecast
     if end_d >= today_d:
         fc_start = max(start_d, today_d)
         df_fc = fetch_open_meteo_forecast(lat, lon, fc_start, end_d, tz)
@@ -258,10 +314,8 @@ def fetch_open_meteo_range(lat: float, lon: float, start_d: date, end_d: date, t
         return pd.DataFrame()
 
     df = pd.concat(parts, ignore_index=True)
-    # Filter to requested window precisely
     mask = (df["date"] >= start_d) & (df["date"] <= end_d)
     df = df.loc[mask].copy()
-    # Sort by time
     df = df.sort_values("time").reset_index(drop=True)
     return df
 
@@ -280,7 +334,6 @@ def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> 
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    # Raw hourly results for the site
     raw_cols = [
         "time",
         "date",
@@ -292,7 +345,6 @@ def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> 
     ]
     hourly_df = df[raw_cols].copy()
 
-    # Pivot: rows hours, columns date, values weather_text
     pivot = hourly_df.pivot_table(
         index="hour_label",
         columns="date",
@@ -305,25 +357,16 @@ def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> 
 
 
 def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Process batch CSV with columns: location,start_date,end_date
-    Returns:
-      - combined hourly results dataframe
-      - failed rows dataframe (with error messages)
-    """
     req = requests_df.copy()
-    # Standardize columns
     req.columns = [c.strip().lower() for c in req.columns]
     required = {"location", "start_date", "end_date"}
     missing = required - set(req.columns)
     if missing:
         raise ValueError(f"Requests CSV missing required columns: {', '.join(sorted(missing))}")
 
-    # Coerce dates
     req["start_date"] = pd.to_datetime(req["start_date"], errors="coerce").dt.date
     req["end_date"] = pd.to_datetime(req["end_date"], errors="coerce").dt.date
 
-    # Join with sites to get lat/lon/tz
     sites_sub = sites_df[["location", "latitude", "longitude", "timezone"]].copy()
     sites_sub["location_key"] = sites_sub["location"].str.strip().str.lower()
     req["location_key"] = req["location"].astype(str).str.strip().str.lower()
@@ -334,7 +377,7 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
     results = []
     failures = []
 
-    for idx, row in merged.iterrows():
+    for _, row in merged.iterrows():
         loc = str(row["location"]).strip()
         lat = row.get("latitude", np.nan)
         lon = row.get("longitude", np.nan)
@@ -364,7 +407,6 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
 
             df_out = df.copy()
             df_out.insert(0, "location", loc)
-            # Reorder and 24h fields
             df_out = df_out[
                 [
                     "location",
@@ -408,10 +450,11 @@ def download_csv_button(df: pd.DataFrame, label: str, file_name: str, help_text:
 def render_sites_editor():
     st.subheader("Sites master (sites.csv)")
     st.caption(
-        "Manage your sites list. Required columns: location, latitude, longitude, timezone (IANA format, e.g., Asia/Kuala_Lumpur)."
+        "Manage your sites list. Required columns: location, latitude, longitude. "
+        "Optional: timezone (IANA, e.g., Asia/Kuala_Lumpur). Uploader accepts common aliases: "
+        "name/site/place → location; lat → latitude; lon/lng/long → longitude; tz/time_zone → timezone."
     )
 
-    # Optional: Upload a new sites.csv to replace current
     uploaded = st.file_uploader(
         "Optionally upload a sites.csv (it will replace current file for this session)",
         type=["csv"],
@@ -420,9 +463,15 @@ def render_sites_editor():
     )
     if uploaded is not None:
         try:
-            df_new = pd.read_csv(uploaded)
-            save_sites_csv(df_new, SITES_CSV)
+            # Auto-detect delimiter and handle BOM
+            df_new = pd.read_csv(uploaded, sep=None, engine="python")
+            df_norm, notes = normalize_sites_columns(df_new)
+            save_sites_csv(df_norm, SITES_CSV)
             st.success("sites.csv replaced from upload.")
+            if notes:
+                for n in notes:
+                    st.info(n)
+            st.cache_data.clear()
         except Exception as e:
             st.error(f"Failed to ingest uploaded sites.csv: {e}")
 
@@ -471,7 +520,6 @@ def render_single_site_ui(sites_df: pd.DataFrame):
     site_names = sites_df["location"].tolist()
     site_sel = st.selectbox("Select a site (from sites.csv)", site_names)
 
-    # default dates: today..today+3
     today_d = date.today()
     default_end = min(today_d + timedelta(days=3), today_d + timedelta(days=FORECAST_MAX_DAYS))
     start_d = st.date_input("Start date", value=today_d, format="YYYY-MM-DD")
@@ -494,10 +542,8 @@ def render_single_site_ui(sites_df: pd.DataFrame):
             st.dataframe(pivot_df, use_container_width=True)
             st.caption("Note: values show simplified weather descriptions per hour.")
 
-            # Downloads
             c1, c2 = st.columns(2)
             with c1:
-                # For pivot CSV, flatten index/columns
                 pivot_flat = pivot_df.copy()
                 pivot_flat.index.name = "hour"
                 pivot_flat.reset_index(inplace=True)
@@ -578,7 +624,6 @@ def main():
         st.header("Sites master")
         render_sites_editor()
 
-    # Load current sites after potential edits
     try:
         sites_df = load_sites_csv(SITES_CSV)
     except Exception as e:
@@ -596,6 +641,7 @@ def main():
     with st.expander("Help / Tips"):
         st.markdown(
             """
+            - Uploader accepts aliases: name/site/place → location; lat → latitude; lon/lng/long → longitude; tz/time_zone → timezone.
             - If you encounter an API error, verify that your timezone in `sites.csv` is a valid IANA zone (e.g., `Asia/Singapore`). Invalid timezones automatically fall back to `auto`.
             - Forecast endpoint typically supports up to 16 days ahead. Longer future ranges are auto-clamped.
             - Past dates are fetched from the Archive API; future from the Forecast API.
