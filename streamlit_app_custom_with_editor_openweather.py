@@ -590,18 +590,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
-
-This version should work without any syntax errors. The main changes from the Open-Meteo version:
-
-1. Uses OpenWeatherMap's 5-day forecast API
-2. Requires an API key (free registration at openweathermap.org)
-3. Returns weather descriptions, temperature, humidity, precipitation, and cloud cover
-4. Handles API key validation and shows helpful error messages
-5. Uses Streamlit secrets for secure API key storage
-
-To set up your API key, create a `.streamlit/secrets.toml` file with:
-```toml
-OPENWEATHERMAP_API_KEY = "your_actual_api_key_here"
-```
-
