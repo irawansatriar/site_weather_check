@@ -47,10 +47,93 @@ USER_AGENT = "site-weather-check/1.0 (+https://github.com/your-org/your-repo)"
 
 
 # --------------------------
+# Calibration (sunny / rain thresholds)
+# --------------------------
+
+DEFAULT_CALIBRATION = {
+    "sunny_max_clouds": 20,      # percent
+    "sunny_max_pop": 0.10,       # 0-1
+    "partly_max_clouds": 60,     # percent
+
+    # Rain intensity by mm/h ( NOAA-style bands ):
+    # light < 2.5, moderate 2.5–7.6, heavy > 7.6
+    "light_min_mmph": 0.10,
+    "moderate_min_mmph": 2.5,
+    "heavy_min_mmph": 7.6,
+
+    # Optional: if mm=0 but POP high and clouds high, treat as light rain
+    "light_pop_fallback": 0.50,  # 0-1
+}
+
+def get_calibration() -> dict:
+    cfg = {**DEFAULT_CALIBRATION, **st.session_state.get("calibration", {})}
+    return cfg
+
+def classify_weather(
+    weather_id: Optional[int],
+    weather_main: str,
+    weather_description: str,
+    precip_mm_per_h: float,
+    clouds_pct: float,
+    pop: Optional[float],
+    calib: dict,
+) -> str:
+    pop = pop if pop is not None else 0.0
+
+    # Thunderstorms / snow / fog first (by code or by category)
+    if isinstance(weather_id, (int, float)):
+        wid = int(weather_id)
+        if 200 <= wid <= 232:
+            return "thunderstorm"
+        if 600 <= wid <= 622:
+            # Snow intensities handled like rain thresholds
+            if precip_mm_per_h >= calib["heavy_min_mmph"]:
+                return "heavy snow"
+            if precip_mm_per_h >= calib["moderate_min_mmph"]:
+                return "moderate snow"
+            if precip_mm_per_h >= calib["light_min_mmph"] or pop >= calib["light_pop_fallback"]:
+                return "light snow"
+            return "snow"
+        if 701 <= wid <= 781:
+            return "foggy"
+
+    # Rain by mm/h
+    if precip_mm_per_h >= calib["heavy_min_mmph"]:
+        return "heavy rain"
+    if precip_mm_per_h >= calib["moderate_min_mmph"]:
+        return "moderate rain"
+    if precip_mm_per_h >= calib["light_min_mmph"]:
+        return "light rain"
+
+    # Fallback to POP + clouds if mm=0
+    if pop >= calib["light_pop_fallback"] and clouds_pct >= max(calib["partly_max_clouds"], 60):
+        return "light rain"
+
+    # Clouds → sky condition
+    if clouds_pct <= calib["sunny_max_clouds"] and pop <= calib["sunny_max_pop"]:
+        return "sunny"
+    if clouds_pct <= calib["partly_max_clouds"]:
+        return "partly cloudy"
+    return "cloudy"
+
+def classify_weather_row(row: pd.Series, calib: dict) -> str:
+    return classify_weather(
+        weather_id=row.get("weather_id"),
+        weather_main=str(row.get("weather_main", "")),
+        weather_description=str(row.get("weather_description", "")),
+        precip_mm_per_h=float(row.get("precip_mm_per_h", row.get("precipitation", 0) or 0)),
+        clouds_pct=float(row.get("cloudcover", 0) or 0),
+        pop=float(row.get("pop", 0) or 0),
+        calib=calib,
+    )
+
+
+# --------------------------
 # Utility Functions
 # --------------------------
 
 def ensure_sites_csv_exists(path: str = SITES_CSV) -> None:
+    """Ensure a default sites.csv exists so the app is usable on first launch."""
     if not os.path.exists(path):
         with open(path, "w", encoding="utf-8") as f:
             f.write(SITES_TEMPLATE_CSV)
@@ -232,19 +315,29 @@ def fetch_openweathermap_forecast(lat: float, lon: float, start_d: date, end_d: 
             weather = item.get("weather", [{}])[0]
             main_weather = weather.get("main", "")
             description = weather.get("description", "")
-            precip = item.get("rain", {}).get("3h", 0) + item.get("snow", {}).get("3h", 0)
-            rows.append({
-                "time": dt,
-                "date": dt.date(),
-                "hour_label": dt.strftime("%H:00"),
-                "weather_main": main_weather,
-                "weather_description": description,
-                "weather_text": owm_weather_to_text(main_weather, description),
-                "precipitation": precip,
-                "cloudcover": item.get("clouds", {}).get("all", 0),
-                "temperature": item.get("main", {}).get("temp", np.nan),
-                "humidity": item.get("main", {}).get("humidity", np.nan),
-            })
+            weather_id = weather.get("id", None)
+
+            rain_3h = float(item.get("rain", {}).get("3h", 0) or 0.0)
+            snow_3h = float(item.get("snow", {}).get("3h", 0) or 0.0)
+            precip_3h = rain_3h + snow_3h
+            precip_mm_per_h = precip_3h / 3.0
+
+            rows.append(
+                {
+                    "time": dt,
+                    "date": dt.date(),
+                    "hour_label": dt.strftime("%H:00"),
+                    "weather_id": weather_id,
+                    "weather_main": main_weather,
+                    "weather_description": description,
+                    "pop": item.get("pop", np.nan),                     # 0–1
+                    "precipitation": precip_3h,                          # mm per 3h
+                    "precip_mm_per_h": precip_mm_per_h,                  # mm/h (for classification)
+                    "cloudcover": item.get("clouds", {}).get("all", 0),  # %
+                    "temperature": item.get("main", {}).get("temp", np.nan),
+                    "humidity": item.get("main", {}).get("humidity", np.nan),
+                }
+            )
 
     return pd.DataFrame(rows)
 
@@ -277,19 +370,28 @@ def fetch_openweathermap_hourly(lat: float, lon: float, start_d: date, end_d: da
             weather = item.get("weather", [{}])[0]
             main_weather = weather.get("main", "")
             description = weather.get("description", "")
-            precip = float(item.get("rain", {}).get("1h", 0)) + float(item.get("snow", {}).get("1h", 0))
-            rows.append({
-                "time": dt,
-                "date": dt.date(),
-                "hour_label": dt.strftime("%H:00"),
-                "weather_main": main_weather,
-                "weather_description": description,
-                "weather_text": owm_weather_to_text(main_weather, description),
-                "precipitation": precip,
-                "cloudcover": item.get("clouds", 0),
-                "temperature": item.get("temp", np.nan),
-                "humidity": item.get("humidity", np.nan),
-            })
+            weather_id = weather.get("id", None)
+
+            rain_1h = float(item.get("rain", {}).get("1h", 0) or 0.0)
+            snow_1h = float(item.get("snow", {}).get("1h", 0) or 0.0)
+            precip_1h = rain_1h + snow_1h
+
+            rows.append(
+                {
+                    "time": dt,
+                    "date": dt.date(),
+                    "hour_label": dt.strftime("%H:00"),
+                    "weather_id": weather_id,
+                    "weather_main": main_weather,
+                    "weather_description": description,
+                    "pop": item.get("pop", np.nan),     # 0–1
+                    "precipitation": precip_1h,         # mm per 1h
+                    "precip_mm_per_h": precip_1h,       # mm/h
+                    "cloudcover": item.get("clouds", 0),
+                    "temperature": item.get("temp", np.nan),
+                    "humidity": item.get("humidity", np.nan),
+                }
+            )
     return pd.DataFrame(rows)
 
 
@@ -319,6 +421,11 @@ def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> 
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
+    calib = get_calibration()
+    df = df.copy()
+    # Classify each hour into a human-friendly label
+    df["weather_text"] = df.apply(lambda r: classify_weather_row(r, calib), axis=1)
+
     raw_cols = [
         "time",
         "date",
@@ -327,6 +434,8 @@ def build_single_site_pivot(site_row: pd.Series, start_d: date, end_d: date) -> 
         "weather_description",
         "weather_text",
         "precipitation",
+        "precip_mm_per_h",
+        "pop",
         "cloudcover",
         "temperature",
         "humidity",
@@ -404,11 +513,17 @@ def process_batch_requests(requests_df: pd.DataFrame, sites_df: pd.DataFrame) ->
                     "weather_description",
                     "weather_text",
                     "precipitation",
+                    "precip_mm_per_h",
+                    "pop",
                     "cloudcover",
                     "temperature",
                     "humidity",
                 ]
             ]
+            # Reclassify for batch results as well
+            calib = get_calibration()
+            df_out["weather_text"] = df_out.apply(lambda r: classify_weather_row(r, calib), axis=1)
+
             results.append(df_out)
 
         except Exception as e:
@@ -436,6 +551,33 @@ def download_csv_button(df: pd.DataFrame, label: str, file_name: str, help_text:
 # --------------------------
 # UI: Streamlit App
 # --------------------------
+
+def render_calibration_ui():
+    st.subheader("Calibration")
+    cfg = get_calibration()
+    c1, c2 = st.columns(2)
+    with c1:
+        sunny_max_clouds = st.slider("Sunny: max clouds (%)", 0, 100, cfg["sunny_max_clouds"])
+        partly_max_clouds = st.slider("Partly: max clouds (%)", 0, 100, cfg["partly_max_clouds"])
+        sunny_max_pop = st.slider("Sunny: max POP", 0.0, 1.0, cfg["sunny_max_pop"], 0.01)
+    with c2:
+        light_min_mmph = st.slider("Light rain min (mm/h)", 0.0, 5.0, cfg["light_min_mmph"], 0.05)
+        moderate_min_mmph = st.slider("Moderate rain min (mm/h)", 0.0, 10.0, cfg["moderate_min_mmph"], 0.05)
+        heavy_min_mmph = st.slider("Heavy rain min (mm/h)", 0.0, 30.0, cfg["heavy_min_mmph"], 0.05)
+        light_pop_fallback = st.slider("If POP ≥, treat as light rain (mm=0)", 0.0, 1.0, cfg["light_pop_fallback"], 0.05)
+
+    if st.button("Apply calibration"):
+        st.session_state["calibration"] = {
+            "sunny_max_clouds": int(sunny_max_clouds),
+            "sunny_max_pop": float(sunny_max_pop),
+            "partly_max_clouds": int(partly_max_clouds),
+            "light_min_mmph": float(light_min_mmph),
+            "moderate_min_mmph": float(moderate_min_mmph),
+            "heavy_min_mmph": float(heavy_min_mmph),
+            "light_pop_fallback": float(light_pop_fallback),
+        }
+        st.success("Calibration saved. Rebuild to apply.")
+
 
 def render_sites_editor():
     st.subheader("Sites master (sites.csv)")
@@ -605,6 +747,13 @@ def main():
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
 
+    # Calibration UI (in sidebar)
+    with st.sidebar:
+        render_calibration_ui()
+        st.header("Sites master")
+        render_sites_editor()
+
+    # Quick API key sanity
     if not OPENWEATHERMAP_API_KEY:
         st.warning("⚠️ OpenWeatherMap API key not configured. Please set it in Streamlit secrets.")
         st.info("Get a free API key at: https://openweathermap.org/api")
@@ -616,10 +765,6 @@ def main():
         "- Uses OpenWeatherMap API (requires free API key)\n"
         "- Edit sites.csv in-app or upload your own"
     )
-
-    with st.sidebar:
-        st.header("Sites master")
-        render_sites_editor()
 
     try:
         sites_df = load_sites_csv(SITES_CSV)
@@ -640,7 +785,7 @@ def main():
             """
             - API Key: Set OPENWEATHERMAP_API_KEY in Streamlit secrets or environment.
             - Rate Limits: OpenWeatherMap free tier allows ~1,000 calls/day.
-            - Date Range: Limited to ~5 days ahead via 5-day/3-hour forecast API, or up to 48 hours hourly data when available.
+            - Date Range: With One Call hourly data, you can query up to ~48 hours. Otherwise, uses 3-hour forecast for longer ranges.
             - File Uploads: Accept aliases for column names (name/site → location, lat → latitude, lon/lng/long → longitude).
             """
         )
